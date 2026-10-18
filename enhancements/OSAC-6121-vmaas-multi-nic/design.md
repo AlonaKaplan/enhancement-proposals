@@ -1016,7 +1016,79 @@ all BM NICs, or does the k8s manager for the network type get involved?
 - **Phase 1.5:** Add `cudn_localnet` k8s manager for "secondary_vlan" role. Multi-NIC with
   primary (EVPN) + secondary (OOB via secondary_vlan) validated end-to-end.
 - **Phase 2:** `sriov` k8s manager for "highspeed" role. Multi-cluster. Additional roles
-  as needed.
+  as needed. Provider-managed network types (see below).
+
+### Phase 2 / Follow-up: Provider-Managed Network Types
+
+Some network types are infrastructure managed by the provider, not tenant-controlled. The
+primary example is OOB: the provider creates VMs on behalf of tenants and adds an OOB NIC so
+the provider can SSH into the VMs for management. Tenants must not be able to reach other VMs
+via the OOB network or modify its security rules.
+
+**`tenant_managed` flag on NetworkType:**
+
+```protobuf
+message NetworkType {
+  // ... existing fields ...
+
+  // When false, only the provider (admin) can create VirtualNetworks and Subnets
+  // of this type. The k8s manager provisions isolation rules (e.g., MultiNetworkPolicy)
+  // as part of the network provisioning — these rules are not exposed via the
+  // tenant-facing SecurityGroup API. The provider adds attachments of this type
+  // when creating VMs; tenants cannot add or remove them.
+  // When true (default), tenants create and manage VirtualNetworks, Subnets,
+  // and SecurityGroups of this type.
+  bool tenant_managed = 7;
+}
+```
+
+**Behavioral differences:**
+
+| | `tenant_managed: true` | `tenant_managed: false` |
+|---|---|---|
+| **Who creates VN/Subnet** | Tenant | Provider (admin) |
+| **Who adds NIC to VM** | Tenant | Provider (when creating VM on tenant's behalf) |
+| **Security rules** | Tenant-facing SecurityGroup API | Provider-controlled, baked into k8s manager (e.g., MultiNetworkPolicy) |
+| **Tenant visibility** | Tenant sees and manages the network | Tenant may see the NIC but cannot modify its rules |
+| **Example** | Tenant EVPN network | OOB management network |
+
+**OOB isolation model:**
+
+For provider-managed OOB, the `cudn_localnet` k8s manager provisions a MultiNetworkPolicy
+at Subnet provisioning time that restricts traffic to the management server only. These rules
+are not exposed via the SecurityGroup API — the tenant cannot weaken them.
+
+```yaml
+# Provisioned by cudn_localnet k8s manager (provider-controlled, not tenant-modifiable)
+MultiNetworkPolicy:
+  name: "oob-isolate"
+  spec:
+    podSelector: {}
+    policyTypes: [Ingress, Egress]
+    ingress:
+      - from:
+          - ipBlock: { cidr: "172.16.0.1/32" }   # Management server only
+    egress:
+      - to:
+          - ipBlock: { cidr: "172.16.0.1/32" }
+```
+
+**SecurityGroup interaction:**
+
+- `tenant_managed: true` networks: `ComputeNetworkAttachment.security_groups` references
+  tenant-created SecurityGroups, enforced by fabric manager (ACLs) or translated to
+  NetworkPolicy/MultiNetworkPolicy for k8s-only types.
+- `tenant_managed: false` networks: `security_groups` on the attachment is either empty
+  (provider controls isolation via k8s manager) or references provider-created SecurityGroups
+  that tenants cannot modify. API validation rejects tenant-created SecurityGroups on
+  provider-managed VirtualNetworks.
+
+**Open questions for Phase 2:**
+- Should the management server IP be configurable on the NetworkType or hardcoded in the
+  k8s manager role?
+- Should tenants see provider-managed NICs in the API response, or should they be hidden?
+- How does the provider specify which VMs get the OOB NIC — via template/catalog item,
+  or a deployment-wide policy?
 
 ## Upgrade / Downgrade Strategy
 
