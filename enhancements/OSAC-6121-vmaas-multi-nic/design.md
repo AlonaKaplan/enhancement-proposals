@@ -160,7 +160,7 @@ message NetworkClass {
 }
 
 message NetworkType {
-  // Role identifier describing the network's purpose.
+  // Tenant-facing role name describing the network's purpose.
   // Examples: "tenant", "secondary_vlan", "highspeed", "storage".
   // This is NOT a k8s manager name — it describes what the network is for,
   // not how it is implemented.
@@ -173,16 +173,17 @@ message NetworkType {
   optional string fabric_manager = 3;
 
   // K8s manager implementation for this role, e.g. "cudn_evpn", "cudn_localnet", "sriov".
+  // Must match a registered k8s manager ConfigMap.
   string k8s_manager = 4;
 
-  // Can this type be a VM's primary NIC (default gateway, DNAT target)?
+  // Whether this combination of managers can serve as a VM's primary NIC
+  // (default gateway, DNAT target). This is a property of the combination —
+  // e.g., cudn_evpn + a fabric manager that provides a gateway = primary-capable,
+  // cudn_localnet alone = not primary-capable.
   bool supports_primary = 5;
 
-  // Can this type be a secondary NIC?
+  // Whether this combination can serve as a secondary NIC.
   bool supports_secondary = 6;
-
-  // Per-type capabilities (IPv4, IPv6, dual-stack, DPU).
-  NetworkClassCapabilities capabilities = 7;
 }
 ```
 
@@ -197,23 +198,20 @@ NetworkClass "prod-region-1":
     - name: "tenant"                           # Role: primary tenant L2/L3
       fabric_manager: "customer-fabric"        # Implementation: customer's fabric manager
       k8s_manager: "cudn_evpn"                # Implementation: OVN-K CUDN with EVPN
-      supports_primary: true
+      supports_primary: true                   # This combination provides a fabric gateway
       supports_secondary: false
-      capabilities: { supports_ipv4: true }
 
     - name: "secondary_vlan"                   # Role: secondary VLAN-attached network
       # no fabric_manager — k8s only           # (used for OOB, storage, monitoring, etc.)
       k8s_manager: "cudn_localnet"             # Implementation: OVN-K CUDN with localnet bridge
-      supports_primary: false
+      supports_primary: false                  # No fabric gateway — secondary only
       supports_secondary: true
-      capabilities: { supports_ipv4: true }
 
     - name: "highspeed"                        # Role: high-speed data plane
       # no fabric_manager — direct hardware
       k8s_manager: "sriov"                     # Implementation: SR-IOV Network Operator
-      supports_primary: false
+      supports_primary: false                  # SR-IOV passthrough — secondary only
       supports_secondary: true
-      capabilities: { supports_ipv4: true }
 ```
 
 ### VirtualNetwork Extension
@@ -339,7 +337,7 @@ k8s managers provision resources into it.
 K8s manager ConfigMap capability declaration:
 
 ```yaml
-# cudn_evpn — primary only
+# cudn_evpn
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -349,10 +347,13 @@ metadata:
     osac.openshift.io/network/k8s-manager: "true"
 data:
   name: cudn_evpn
-  capabilities: "supports_ipv4:true,supports_primary:true,supports_secondary:false"
+  description: "OVN-Kubernetes CUDN with EVPN transport"
+  capabilities: "supports_ipv4:true,supports_ipv6:false"
+  # supports_primary/secondary is NOT here — that depends on the
+  # combination with a fabric manager, configured in NetworkType
 
 ---
-# cudn_localnet — secondary only (localnet bridge to physical VLAN)
+# cudn_localnet
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -362,10 +363,11 @@ metadata:
     osac.openshift.io/network/k8s-manager: "true"
 data:
   name: cudn_localnet
-  capabilities: "supports_ipv4:true,supports_primary:false,supports_secondary:true"
+  description: "OVN-Kubernetes CUDN with localnet bridge to physical VLAN"
+  capabilities: "supports_ipv4:true,supports_ipv6:false"
 
 ---
-# sriov — secondary only (high-speed)
+# sriov
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -375,7 +377,8 @@ metadata:
     osac.openshift.io/network/k8s-manager: "true"
 data:
   name: sriov
-  capabilities: "supports_ipv4:true,supports_primary:false,supports_secondary:true"
+  description: "SR-IOV passthrough for high-speed VM networking"
+  capabilities: "supports_ipv4:true,supports_ipv6:false"
 ```
 
 #### KubeVirt VMI Composition
@@ -566,8 +569,9 @@ collections/ansible_collections/osac/templates/roles/sriov/
 k8s_manager: sriov
 capabilities:
   supports_ipv4: true
-  supports_primary: false
-  supports_secondary: true
+  supports_ipv6: false
+  # supports_primary/secondary not here — that's a property of the
+  # NetworkType combination, configured by admin in NetworkClass
 ```
 
 **`tasks/create_subnet.yaml`:**
@@ -682,7 +686,6 @@ NetworkClass "prod-region-1":
       k8s_manager: "sriov"
       supports_primary: false
       supports_secondary: true
-      capabilities: { supports_ipv4: true }
 ```
 
 #### What the Provider Does NOT Touch
@@ -720,7 +723,9 @@ This is decision #11 ("Pluggable managers via ConfigMap: Adding a new manager = 
 **NetworkClass proto (`network_class_type.proto`):**
 - Add `repeated NetworkType network_types = 13` field
 - Add `NetworkType` message with `name`, `title`, `fabric_manager`, `k8s_manager`,
-  `supports_primary`, `supports_secondary`, `capabilities`
+  `supports_primary`, `supports_secondary`
+- `supports_primary`/`supports_secondary` are on NetworkType (property of the manager
+  combination), while intrinsic capabilities (IPv4/IPv6) stay on the k8s manager ConfigMap
 
 **VirtualNetwork proto (`virtual_network_type.proto`):**
 - Add `optional string network_type = 5` to `VirtualNetworkSpec` (OPTIONAL, IMMUTABLE)
