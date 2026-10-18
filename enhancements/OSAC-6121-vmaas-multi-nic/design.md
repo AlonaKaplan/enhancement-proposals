@@ -253,23 +253,22 @@ message SubnetStatus {
 }
 
 message SubnetNetworkBinding {
-  // "pod" for primary UDN, "multus" for secondary.
-  string kubevirt_network_type = 1;
-
   // KubeVirt interface binding method: "bridge", "sriov", "masquerade".
-  string kubevirt_binding = 2;
+  string kubevirt_binding = 1;
 
-  // NAD reference for secondary networks (e.g., "oob-sub/oob-vlan100-nad").
+  // NAD reference for secondary networks (e.g., "oob-vlan100-nad").
   // Empty for primary (primary uses pod network, no NAD ref needed).
-  optional string nad_name = 3;
+  // The VM reconciler determines whether to use pod: {} or multus: {} from
+  // the ComputeNetworkAttachment.primary field, not from this binding.
+  optional string nad_name = 2;
 
   // Namespace where VMs are placed (primary only — the k8s manager creates this).
-  optional string namespace_name = 4;
+  optional string namespace_name = 3;
 
   // Label key+value to add to the primary namespace so this
   // secondary network's CUDN/NAD namespace selector matches.
-  optional string namespace_label_key = 5;
-  optional string namespace_label_value = 6;
+  optional string namespace_label_key = 4;
+  optional string namespace_label_value = 5;
 }
 ```
 
@@ -394,13 +393,16 @@ ComputeInstance:
       - subnet: "sriov-sub"       # secondary — SR-IOV high-speed
 ```
 
-**Step 1: Resolve each attachment's binding from Subnet status**
+**Step 1: Resolve each attachment's binding from Subnet status and primary flag**
+
+The VM reconciler reads `SubnetStatus.network_binding` for the binding method and NAD name,
+and uses `ComputeNetworkAttachment.primary` to determine `pod: {}` vs `multus: {}`:
 
 ```
-workload-sub  -> status.network_binding -> { type: pod,    binding: bridge, role: primary   }
-oob-sub-1     -> status.network_binding -> { type: multus, binding: bridge, nad: "oob-vlan100-nad" }
-oob-sub-2     -> status.network_binding -> { type: multus, binding: bridge, nad: "oob-vlan200-nad" }
-sriov-sub     -> status.network_binding -> { type: multus, binding: sriov,  nad: "sriov-net-nad"   }
+workload-sub  -> primary: true  + binding: bridge                         -> pod: {}
+oob-sub-1     -> primary: false + binding: bridge, nad: "oob-vlan100-nad" -> multus: { networkName: "oob-vlan100-nad" }
+oob-sub-2     -> primary: false + binding: bridge, nad: "oob-vlan200-nad" -> multus: { networkName: "oob-vlan200-nad" }
+sriov-sub     -> primary: false + binding: sriov,  nad: "sriov-net-nad"   -> multus: { networkName: "sriov-net-nad" }
 ```
 
 **Step 2: Label namespace for secondary networks**
@@ -458,14 +460,16 @@ The asymmetry between primary and secondary:
 
 | | Primary NIC | Secondary NIC(s) |
 |---|---|---|
-| **KubeVirt network type** | `pod: {}` | `multus: { networkName: "..." }` |
+| **Determined by** | `ComputeNetworkAttachment.primary = true` | All other attachments |
+| **KubeVirt network type** | `pod: {}` (derived from `primary` flag) | `multus: { networkName }` (derived from `primary` flag + `nad_name` from binding) |
 | **How VM connects** | Pod network (which IS the primary CUDN) | Multus injects additional interface from NAD |
 | **k8s manager creates** | CUDN with `role: Primary` -> namespace's pod network | CUDN with `role: Secondary` -> generates NAD, or direct NAD |
 | **Namespace requirement** | k8s manager creates the namespace | Namespace must have matching label for NAD to be available |
-| **KubeVirt binding** | `bridge: {}` (or `masquerade: {}`) | `bridge: {}` or `sriov: {}` depending on type |
+| **KubeVirt binding** | From `SubnetNetworkBinding.kubevirt_binding` | From `SubnetNetworkBinding.kubevirt_binding` |
 
-The reconciler does not hardcode any k8s-manager-specific logic. It reads
-`SubnetStatus.network_binding` and mechanically composes the VMI spec.
+The reconciler does not hardcode any k8s-manager-specific logic. It reads the `primary` flag
+from the attachment and `SubnetStatus.network_binding` from the subnet, then mechanically
+composes the VMI spec.
 
 **Secondary CUDNs and NADs:** OVN-K secondary CUDNs (like those created by `cudn_localnet`) automatically generate a
 `NetworkAttachmentDefinition` in each matching namespace. From KubeVirt's perspective, both
@@ -611,10 +615,8 @@ capabilities:
 - name: Report binding info
   ansible.builtin.set_stats:
     data:
-      kubevirt_network_type: "multus"
       kubevirt_binding: "sriov"
       nad_name: "{{ subnet_name }}-sriov"
-      network_role: "secondary"
       namespace_label_key: "sriov-{{ subnet_name }}"
       namespace_label_value: "true"
 ```
@@ -698,8 +700,11 @@ The contract between the k8s manager and the rest of OSAC is the **output bindin
 to Subnet status:
 
 ```
-{ kubevirt_network_type, kubevirt_binding, nad_name, network_role, namespace_label_* }
+{ kubevirt_binding, nad_name, namespace_name, namespace_label_* }
 ```
+
+The VM reconciler determines `pod: {}` vs `multus: {}` from the `ComputeNetworkAttachment.primary`
+field — this is not part of the k8s manager's output.
 
 Any k8s manager that produces this output works with the existing VM reconciler. The dispatcher
 routes to the manager by name (from the `network_types` entry), and the manager's Ansible role
