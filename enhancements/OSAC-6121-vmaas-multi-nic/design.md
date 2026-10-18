@@ -29,7 +29,7 @@ to specific manager pairings (fabric_manager + k8s_manager). Each VirtualNetwork
 `network_type`,
 and the dispatcher routes provisioning to the matching managers. The k8s manager contract is extended
 with primary/secondary role semantics and a `SubnetNetworkBinding` output contract that lets the VM
-reconciler compose KubeVirt VMI specs without k8s-manager-specific logic. New network roles can be
+reconciler compose KubeVirt VM specs without k8s-manager-specific logic. New network roles can be
 added by deploying a ConfigMap + Ansible role — no code changes to existing managers, the dispatcher,
 or the VM reconciler.
 
@@ -45,7 +45,7 @@ or the VM reconciler.
 - **OSAC-1435 VMaaS Networking** — Defines `ComputeNetworkAttachment` with `subnet`,
   `security_groups`, and `primary` fields. Already supports `repeated` attachments (multi-NIC at
   the API level). This design specifies how the VM reconciler uses `SubnetStatus.network_binding`
-  to compose the KubeVirt VMI.
+  to compose the KubeVirt VM.
 - **OSAC-1437 BMaaS Networking** — Defines `BareMetalNetworkAttachment` with `interface` and
   `primary` fields. Already supports multi-NIC with different physical interfaces. This design
   extends the same pattern to VMs with different virtual network backends.
@@ -81,7 +81,7 @@ require SR-IOV interfaces for high-speed workloads in the future.
 - Enable VMs with multiple NICs where each NIC connects to a different network type with
   a different backend implementation
 - Define a generic k8s manager output contract (`SubnetNetworkBinding`) so the VM reconciler
-  composes KubeVirt VMI specs without k8s-manager-specific logic
+  composes KubeVirt VM specs without k8s-manager-specific logic
 - Allow providers to add new network roles by deploying a ConfigMap + Ansible role — no changes
   to existing managers, dispatcher, or VM reconciler (extending decision #11 to multi-NIC)
 - Maintain backward compatibility — omitting `network_type` on a VirtualNetwork uses the
@@ -142,7 +142,7 @@ The NetworkClass is extended with a `network_types` list. Each entry maps a role
 specific (fabric_manager, k8s_manager) pair with primary/secondary capabilities. VirtualNetworks
 select a `network_type` and the dispatcher routes provisioning accordingly. The k8s manager
 writes a `SubnetNetworkBinding` into Subnet status that tells the VM reconciler exactly how to
-compose the KubeVirt VMI — no manager-specific logic in the reconciler.
+compose the KubeVirt VM — no manager-specific logic in the reconciler.
 
 ### NetworkClass Extension
 
@@ -235,7 +235,7 @@ message VirtualNetworkSpec {
 ### Subnet Status: Network Binding Output Contract
 
 The k8s manager writes its output via `set_stats`. The Subnet controller writes it into Subnet
-status. The VM reconciler reads it when composing the KubeVirt VMI. No extra ConfigMap needed
+status. The VM reconciler reads it when composing the KubeVirt VM. No extra ConfigMap needed
 for k8s manager output — the only ConfigMap in the chain is the existing fabric-to-k8s inter-job
 one for VNI data (from OSAC-4291).
 
@@ -251,7 +251,8 @@ message SubnetStatus {
 }
 
 message SubnetNetworkBinding {
-  // KubeVirt interface binding method: "bridge", "sriov", "masquerade".
+  // KubeVirt interface binding method: "l2-bridge" (primary UDN),
+  // "bridge" (secondary bridge), "sriov" (SR-IOV passthrough).
   string kubevirt_binding = 1;
 
   // NAD reference for secondary networks (e.g., "oob-vlan100-nad").
@@ -381,7 +382,7 @@ data:
   capabilities: "supports_ipv4:true,supports_ipv6:false"
 ```
 
-#### KubeVirt VMI Composition
+#### KubeVirt VM Composition
 
 Given this ComputeInstance:
 
@@ -402,10 +403,10 @@ The VM reconciler reads `SubnetStatus.network_binding` for the binding method an
 and uses `ComputeNetworkAttachment.primary` to determine `pod: {}` vs `multus: {}`:
 
 ```
-workload-sub  -> primary: true  + binding: bridge                         -> pod: {}
-oob-sub-1     -> primary: false + binding: bridge, nad: "oob-vlan100-nad" -> multus: { networkName: "oob-vlan100-nad" }
-oob-sub-2     -> primary: false + binding: bridge, nad: "oob-vlan200-nad" -> multus: { networkName: "oob-vlan200-nad" }
-sriov-sub     -> primary: false + binding: sriov,  nad: "sriov-net-nad"   -> multus: { networkName: "sriov-net-nad" }
+workload-sub  -> primary: true  + binding: l2-bridge                       -> pod: {}
+oob-sub-1     -> primary: false + binding: bridge, nad: "oob-vlan100-nad"  -> multus: { networkName: "oob-vlan100-nad" }
+oob-sub-2     -> primary: false + binding: bridge, nad: "oob-vlan200-nad"  -> multus: { networkName: "oob-vlan200-nad" }
+sriov-sub     -> primary: false + binding: sriov,  nad: "sriov-net-nad"    -> multus: { networkName: "sriov-net-nad" }
 ```
 
 **Step 2: Label namespace for secondary networks**
@@ -423,7 +424,7 @@ Namespace "workload-sub":
     sriov-enabled: "true"               # added — matches SR-IOV NAD
 ```
 
-**Step 3: Compose KubeVirt VMI**
+**Step 3: Compose KubeVirt VM**
 
 ```yaml
 apiVersion: kubevirt.io/v1
@@ -438,13 +439,14 @@ spec:
         devices:
           interfaces:
             - name: tenant              # Primary — EVPN to fabric
-              bridge: {}                # binding from Subnet status
+              binding:
+                name: l2-bridge         # Primary UDN binding plugin
             - name: oob-1              # Secondary — OOB VLAN 100
               bridge: {}
             - name: oob-2              # Secondary — OOB VLAN 200
               bridge: {}
             - name: highspeed          # Secondary — SR-IOV
-              sriov: {}                # binding from Subnet status
+              sriov: {}
       networks:
         - name: tenant
           pod: {}                      # Primary UDN — pod network IS the CUDN
@@ -468,11 +470,11 @@ The asymmetry between primary and secondary:
 | **How VM connects** | Pod network (which IS the primary CUDN) | Multus injects additional interface from NAD |
 | **k8s manager creates** | CUDN with `role: Primary` -> namespace's pod network | CUDN with `role: Secondary` -> generates NAD, or direct NAD |
 | **Namespace requirement** | k8s manager creates the namespace | Namespace must have matching label for NAD to be available |
-| **KubeVirt binding** | From `SubnetNetworkBinding.kubevirt_binding` | From `SubnetNetworkBinding.kubevirt_binding` |
+| **KubeVirt binding** | `binding: { name: l2-bridge }` (primary UDN plugin) | `bridge: {}` or `sriov: {}` (from `SubnetNetworkBinding.kubevirt_binding`) |
 
 The reconciler does not hardcode any k8s-manager-specific logic. It reads the `primary` flag
 from the attachment and `SubnetStatus.network_binding` from the subnet, then mechanically
-composes the VMI spec.
+composes the VM spec.
 
 **Secondary CUDNs and NADs:** OVN-K secondary CUDNs (like those created by `cudn_localnet`) automatically generate a
 `NetworkAttachmentDefinition` in each matching namespace. From KubeVirt's perspective, both
@@ -873,7 +875,7 @@ those labels declaratively based on `SubnetNetworkBinding` output.
 | **Subnet proto** | Add `optional SubnetNetworkBinding network_binding` to status |
 | **Dispatcher** | Route based on `(NetworkClass, VN.network_type)` instead of just `(NetworkClass)` |
 | **K8s manager ConfigMap** | Add `supports_primary` / `supports_secondary` to capabilities |
-| **VM reconciler** | Read `SubnetStatus.network_binding` to compose VMI `networks[]` + `interfaces[]` |
+| **VM reconciler** | Read `SubnetStatus.network_binding` to compose VM `spec.template.spec.networks[]` + `spec.template.spec.domain.devices.interfaces[]` |
 | **VM reconciler** | Label primary namespace for secondary network selectors |
 | **Networking decisions doc** | Decision #6 stays (one NC per deployment), but NC now declares multiple network types |
 
@@ -995,7 +997,7 @@ all BM NICs, or does the k8s manager for the network type get involved?
 - Dispatcher uses top-level defaults when `network_type` is not set
 - Subnet controller writes `network_binding` from k8s manager `set_stats` output
 - Subnet controller validates `network_binding` fields before setting READY
-- VM reconciler composes VMI with correct `networks[]` and `interfaces[]` from binding
+- VM reconciler composes VM with correct `networks[]` and `interfaces[]` from binding
 - VM reconciler adds namespace labels for secondary network selectors
 - VM reconciler removes namespace labels when VM is deleted (if no other VMs need them)
 
@@ -1003,7 +1005,7 @@ all BM NICs, or does the k8s manager for the network type get involved?
 
 - Create NetworkClass with multiple `network_types`
 - Create VNs with different `network_type` values, verify dispatcher routes correctly
-- Create multi-NIC VM, verify KubeVirt VMI has correct network/interface entries
+- Create multi-NIC VM, verify KubeVirt VM has correct network/interface entries
 - Verify secondary CUDN NAD is available in primary namespace after label addition
 - Verify OOB MultiNetworkPolicy blocks inter-VM traffic
 
