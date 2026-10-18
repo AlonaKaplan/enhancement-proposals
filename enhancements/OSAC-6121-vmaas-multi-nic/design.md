@@ -24,8 +24,9 @@ superseded-by:
 This design extends OSAC-1433's single-NetworkClass architecture to support multiple network types
 within one NetworkClass, enabling VMs (and bare-metal instances) to have multiple NICs where each NIC
 connects to a network with a different role and different backend implementation. The NetworkClass
-gains a `network_types` list that maps role names (e.g., "tenant", "oob", "highspeed") to specific
-manager pairings (fabric_manager + k8s_manager). Each VirtualNetwork selects a `network_type`,
+gains a `network_types` list that maps role names (e.g., "tenant", "secondary_vlan", "highspeed")
+to specific manager pairings (fabric_manager + k8s_manager). Each VirtualNetwork selects a
+`network_type`,
 and the dispatcher routes provisioning to the matching managers. The k8s manager contract is extended
 with primary/secondary role semantics and a `SubnetNetworkBinding` output contract that lets the VM
 reconciler compose KubeVirt VMI specs without k8s-manager-specific logic. New network roles can be
@@ -56,14 +57,15 @@ the physical fabric via BGP EVPN. However, real-world deployments require VMs wi
 connected to networks with fundamentally different backend implementations:
 
 - **Primary NIC**: Tenant traffic via CUDN+EVPN (fabric-bridged, L2/L3 reachable from bare-metal)
-- **Secondary NIC**: Out-of-band management via localnet (isolated, only management server can
-  reach VMs, VMs cannot communicate with each other through this network)
-- **Secondary NIC**: High-speed data via SR-IOV (hardware passthrough for performance-sensitive
-  workloads)
-- **Secondary NIC**: Storage network via dedicated VLAN (for NFS/iSCSI access)
+- **Secondary NIC**: Out-of-band management via secondary VLAN (`cudn_localnet` implementation —
+  isolated, only management server can reach VMs, VMs cannot communicate with each other)
+- **Secondary NIC**: High-speed data via SR-IOV (`sriov` implementation — hardware passthrough
+  for performance-sensitive workloads)
+- **Secondary NIC**: Storage network via dedicated VLAN (`cudn_localnet` implementation — for
+  NFS/iSCSI access)
 
-Each role requires a different k8s manager implementation (CUDN EVPN, localnet CUDN, SR-IOV
-network, etc.) and potentially a different or no fabric manager. The current model — one
+Each role requires a different k8s manager implementation (`cudn_evpn`, `cudn_localnet`, `sriov`,
+etc.) and potentially a different or no fabric manager. The current model — one
 `fabric_manager` + one `k8s_manager` per NetworkClass — cannot express this.
 
 **Concrete customer scenario:** A customer wants VMaaS with CUDN+EVPN as the k8s manager and
@@ -87,8 +89,8 @@ require SR-IOV interfaces for high-speed workloads in the future.
 
 ### Non-Goals
 
-- Implementing specific k8s managers (localnet, SR-IOV) — those are separate designs that
-  conform to the contract defined here
+- Implementing specific k8s managers (`cudn_localnet`, `sriov`) — those are separate designs
+  that conform to the contract defined here
 - Multi-cluster VM placement with multi-NIC (deferred to Phase 2)
 - Hot-plugging NICs after VM creation (attachment topology is create-time only)
 - NetworkPolicy or MultiNetworkPolicy management beyond what individual k8s managers provide
@@ -112,6 +114,27 @@ already follows this pattern. The GCP model is the closest match: each NIC is in
 VPC Network (= VirtualNetwork), and different VPCs can have different backends. What's missing
 in OSAC is the ability to route different VirtualNetworks to different managers within the single
 NetworkClass.
+
+### Network Type vs K8s Manager: Role vs Implementation
+
+A key distinction in this design:
+
+- **Network type** (role) describes the **purpose** of the network — what it is used for.
+  Examples: `"tenant"` (primary tenant L2/L3), `"secondary_vlan"` (secondary VLAN-attached
+  network for OOB, storage, etc.), `"highspeed"` (SR-IOV/DPDK passthrough).
+- **K8s manager** (implementation) describes **how** the network is provisioned on Kubernetes.
+  Examples: `"cudn_evpn"` (OVN-K CUDN with EVPN transport), `"cudn_localnet"` (OVN-K CUDN
+  with localnet bridge), `"sriov"` (SR-IOV Network Operator).
+
+The same k8s manager can serve multiple roles. For example, `cudn_localnet` could back both
+a `"secondary_vlan"` type (for OOB management) and a `"storage_vlan"` type (for NFS access) —
+same implementation, different purpose, potentially different configuration. Conversely, the
+same role could be served by different k8s managers in different deployments (e.g., `"highspeed"`
+might use `"sriov"` in one deployment and `"dpdk"` in another).
+
+The tenant never sees the k8s manager name. They create a VirtualNetwork with
+`network_type: "secondary_vlan"` and the NetworkClass maps that role to the appropriate
+implementation.
 
 ### Central Design Statement
 
@@ -137,16 +160,19 @@ message NetworkClass {
 }
 
 message NetworkType {
-  // Identifier, e.g. "tenant", "oob", "highspeed", "storage".
+  // Role identifier describing the network's purpose.
+  // Examples: "tenant", "secondary_vlan", "highspeed", "storage".
+  // This is NOT a k8s manager name — it describes what the network is for,
+  // not how it is implemented.
   string name = 1;
 
-  // Human-friendly label.
+  // Human-friendly label, e.g. "Tenant Network", "Secondary VLAN", "High-Speed SR-IOV".
   string title = 2;
 
-  // Fabric manager for this type. Empty = no fabric manager (k8s-only).
+  // Fabric manager implementation for this role. Empty = no fabric manager (k8s-only).
   optional string fabric_manager = 3;
 
-  // K8s manager for this type.
+  // K8s manager implementation for this role, e.g. "cudn_evpn", "cudn_localnet", "sriov".
   string k8s_manager = 4;
 
   // Can this type be a VM's primary NIC (default gateway, DNAT target)?
@@ -168,23 +194,23 @@ NetworkClass "prod-region-1":
   k8s_manager: "cudn_evpn"              # Default (backward compat)
 
   network_types:
-    - name: "tenant"
-      fabric_manager: "customer-fabric"
-      k8s_manager: "cudn_evpn"
+    - name: "tenant"                           # Role: primary tenant L2/L3
+      fabric_manager: "customer-fabric"        # Implementation: customer's fabric manager
+      k8s_manager: "cudn_evpn"                # Implementation: OVN-K CUDN with EVPN
       supports_primary: true
       supports_secondary: false
       capabilities: { supports_ipv4: true }
 
-    - name: "oob"
-      # no fabric_manager — k8s only
-      k8s_manager: "localnet"
+    - name: "secondary_vlan"                   # Role: secondary VLAN-attached network
+      # no fabric_manager — k8s only           # (used for OOB, storage, monitoring, etc.)
+      k8s_manager: "cudn_localnet"             # Implementation: OVN-K CUDN with localnet bridge
       supports_primary: false
       supports_secondary: true
       capabilities: { supports_ipv4: true }
 
-    - name: "highspeed"
+    - name: "highspeed"                        # Role: high-speed data plane
       # no fabric_manager — direct hardware
-      k8s_manager: "sriov"
+      k8s_manager: "sriov"                     # Implementation: SR-IOV Network Operator
       supports_primary: false
       supports_secondary: true
       capabilities: { supports_ipv4: true }
@@ -270,8 +296,9 @@ Different attachments can reference subnets from different VirtualNetworks (whic
 different `network_type` values and thus route to different managers). The `primary` field
 on the attachment (from decision #9) designates the default gateway NIC.
 
-Multiple secondary attachments of the same `network_type` are allowed (e.g., two OOB NICs
-on different VLANs in different VirtualNetworks). There is no "one NIC per type" constraint.
+Multiple secondary attachments of the same `network_type` are allowed (e.g., two
+`secondary_vlan` NICs on different VLANs in different VirtualNetworks — one for OOB, one for
+storage). There is no "one NIC per type" constraint.
 
 ### Workflow Description
 
@@ -286,9 +313,9 @@ Subnet "workload-sub"
       -> fabric_manager: "customer-fabric", k8s_manager: "cudn_evpn"
 
 Subnet "oob-sub"
-  -> VN "my-oob-net" (network_type: "oob")
-    -> NetworkClass.network_types["oob"]
-      -> k8s_manager: "localnet" (no fabric manager)
+  -> VN "my-oob-net" (network_type: "secondary_vlan")
+    -> NetworkClass.network_types["secondary_vlan"]
+      -> k8s_manager: "cudn_localnet" (no fabric manager)
 ```
 
 Same single NetworkClass, different managers per VN depending on the `network_type`.
@@ -303,7 +330,7 @@ k8s managers provision resources into it.
 - Creates CUDN with `role: Primary`
 - VM lives in this namespace
 
-**Secondary k8s manager** (e.g., `localnet`, `sriov`):
+**Secondary k8s manager** (e.g., `cudn_localnet`, `sriov`):
 - Does NOT create a namespace
 - Creates a CUDN with `role: Secondary` (generates NAD), or a SriovNetwork (generates NAD),
   or a direct NAD
@@ -326,16 +353,16 @@ data:
   capabilities: "supports_ipv4:true,supports_primary:true,supports_secondary:false"
 
 ---
-# localnet — secondary only (OOB)
+# cudn_localnet — secondary only (localnet bridge to physical VLAN)
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: k8s-manager-localnet
+  name: k8s-manager-cudn-localnet
   namespace: osac
   labels:
     osac.openshift.io/network/k8s-manager: "true"
 data:
-  name: localnet
+  name: cudn_localnet
   capabilities: "supports_ipv4:true,supports_primary:false,supports_secondary:true"
 
 ---
@@ -362,8 +389,8 @@ ComputeInstance:
     network_attachments:
       - subnet: "workload-sub"     # primary
         primary: true
-      - subnet: "oob-sub-1"       # secondary — OOB VLAN 100
-      - subnet: "oob-sub-2"       # secondary — OOB VLAN 200
+      - subnet: "oob-sub-1"       # secondary — secondary_vlan, OOB VLAN 100
+      - subnet: "oob-sub-2"       # secondary — secondary_vlan, OOB VLAN 200
       - subnet: "sriov-sub"       # secondary — SR-IOV high-speed
 ```
 
@@ -440,19 +467,20 @@ The asymmetry between primary and secondary:
 The reconciler does not hardcode any k8s-manager-specific logic. It reads
 `SubnetStatus.network_binding` and mechanically composes the VMI spec.
 
-**Secondary CUDNs and NADs:** OVN-K secondary CUDNs (like localnet) automatically generate a
+**Secondary CUDNs and NADs:** OVN-K secondary CUDNs (like those created by `cudn_localnet`) automatically generate a
 `NetworkAttachmentDefinition` in each matching namespace. From KubeVirt's perspective, both
 secondary CUDNs and direct NADs look the same — they are all referenced via
 `multus: { networkName: "..." }`. The k8s manager's output binding tells the reconciler the
 NAD name regardless of whether the underlying resource is a CUDN (which auto-generates NADs)
 or a directly-created NAD.
 
-### OOB Localnet Network Specifics
+### OOB Use Case: secondary_vlan with cudn_localnet
 
-For the customer's localnet OOB with MultiNetworkPolicy isolation:
+For the customer's OOB management network — the `cudn_localnet` k8s manager (implementation)
+serves the `secondary_vlan` network type (role), with MultiNetworkPolicy isolation:
 
 ```yaml
-# localnet k8s manager creates at Subnet provisioning time:
+# cudn_localnet k8s manager creates at Subnet provisioning time:
 ClusterUserDefinedNetwork:
   name: "oob-mgmt"
   spec:
@@ -488,9 +516,9 @@ as a secondary interface in that namespace.
 
 ### How a Provider Implements a New Network Role
 
-This is the key extensibility property. Adding a new role (e.g., "highspeed" SR-IOV) is a
-**deploy-time operation** — no code changes to existing `cudn_evpn` or `localnet` playbooks,
-no changes to the dispatcher, no changes to the VM reconciler.
+This is the key extensibility property. Adding a new role (e.g., "highspeed" using the `sriov`
+k8s manager) is a **deploy-time operation** — no code changes to existing `cudn_evpn` or
+`cudn_localnet` playbooks, no changes to the dispatcher, no changes to the VM reconciler.
 
 #### What the Provider Delivers
 
@@ -643,8 +671,8 @@ NetworkClass "prod-region-1":
       k8s_manager: "cudn_evpn"
       supports_primary: true
       supports_secondary: false
-    - name: "oob"
-      k8s_manager: "localnet"
+    - name: "secondary_vlan"
+      k8s_manager: "cudn_localnet"
       supports_primary: false
       supports_secondary: true
     # NEW — added by provider, no existing code touched
@@ -659,8 +687,8 @@ NetworkClass "prod-region-1":
 
 | Artifact | Changed? | Why |
 |----------|----------|-----|
-| `cudn_evpn` Ansible role | No | Handles "tenant" type independently |
-| `localnet` Ansible role | No | Handles "oob" type independently |
+| `cudn_evpn` Ansible role | No | Handles "tenant" role independently |
+| `cudn_localnet` Ansible role | No | Handles "secondary_vlan" role independently |
 | `netris` or other fabric manager role | No | Independent provisioning |
 | Subnet controller / dispatcher code | No | Routes by `network_type` name generically |
 | VM reconciler | No | Reads `SubnetStatus.network_binding` generically |
@@ -715,7 +743,7 @@ VirtualNetwork:
   name: "my-oob-net"
   spec:
     network_class: "prod-region-1"
-    network_type: "oob"
+    network_type: "secondary_vlan"      # Role — OOB is one use of secondary_vlan
     ipv4_cidr: "172.16.0.0/24"
 
 VirtualNetwork:
@@ -732,8 +760,9 @@ Subnet: { name: "sriov-sub", spec: { virtual_network: "my-sriov-net",   ipv4_cid
 
 # 3. Provisioning dispatches to different managers per network_type:
 # work-sub  -> dispatcher -> customer-fabric + cudn_evpn (creates namespace + CUDN Primary)
-# oob-sub   -> dispatcher -> localnet only (creates CUDN Secondary + MultiNetworkPolicy)
+# oob-sub   -> dispatcher -> cudn_localnet only (creates CUDN Secondary + MultiNetworkPolicy)
 # sriov-sub -> dispatcher -> sriov only (creates SriovNetwork -> NAD)
+# Note: "secondary_vlan" is the role, "cudn_localnet" is the k8s manager implementation
 
 # 4. VM with multi-NIC
 ComputeInstance:
@@ -742,8 +771,8 @@ ComputeInstance:
     network_attachments:
       - subnet: "work-sub"    # Primary — EVPN to fabric
         primary: true
-      - subnet: "oob-sub"     # Secondary — localnet OOB
-      - subnet: "sriov-sub"   # Secondary — SR-IOV high-speed
+      - subnet: "oob-sub"     # Secondary — secondary_vlan (OOB use case)
+      - subnet: "sriov-sub"   # Secondary — highspeed (SR-IOV)
 ```
 
 ### Security Considerations
@@ -755,7 +784,7 @@ ComputeInstance:
 - Each VirtualNetwork is tenant-scoped; cross-tenant network attachment is not possible
 
 **OOB Isolation:**
-- MultiNetworkPolicy enforced by the localnet k8s manager restricts inter-VM traffic
+- MultiNetworkPolicy enforced by the `cudn_localnet` k8s manager restricts inter-VM traffic
   on the OOB network
 - Only the designated management server IP can reach VMs through the OOB interface
 - VMs cannot communicate with each other via the OOB network
@@ -780,8 +809,8 @@ At ComputeInstance creation:
 2. Primary attachment's VN must have a `network_type` where `supports_primary: true`
 3. Secondary attachments' VNs must have a `network_type` where `supports_secondary: true`
 4. All referenced subnets must be in READY state with `network_binding` populated
-5. Multiple secondaries of the same `network_type` are allowed (e.g., two OOB NICs
-   on different VLANs in different VirtualNetworks)
+5. Multiple secondaries of the same `network_type` are allowed (e.g., two
+   `secondary_vlan` NICs on different VLANs in different VirtualNetworks)
 6. No two attachments may reference the same Subnet (prevents duplicate NICs)
 
 At VirtualNetwork creation:
@@ -972,9 +1001,10 @@ all BM NICs, or does the k8s manager for the network type get involved?
 
 - **Phase 1:** Ship CUDN+EVPN as "tenant" type with the `network_types` framework.
   Single-NIC only (no secondary types implemented yet). Backward compatible.
-- **Phase 1.5:** Add `localnet` k8s manager for OOB secondary networks. Multi-NIC with
-  primary (EVPN) + secondary (OOB) validated end-to-end.
-- **Phase 2:** SR-IOV k8s manager. Multi-cluster. Additional network types as needed.
+- **Phase 1.5:** Add `cudn_localnet` k8s manager for "secondary_vlan" role. Multi-NIC with
+  primary (EVPN) + secondary (OOB via secondary_vlan) validated end-to-end.
+- **Phase 2:** `sriov` k8s manager for "highspeed" role. Multi-cluster. Additional roles
+  as needed.
 
 ## Upgrade / Downgrade Strategy
 
